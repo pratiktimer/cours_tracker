@@ -4,7 +4,6 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
@@ -13,7 +12,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -23,16 +21,15 @@ import androidx.compose.material.Checkbox
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.*
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -117,7 +114,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun videoDao(): VideoDao
 
     companion object {
-        @Volatile private var INSTANCE: AppDatabase? = null
+        @Volatile
+        private var INSTANCE: AppDatabase? = null
 
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
@@ -137,19 +135,20 @@ abstract class AppDatabase : RoomDatabase() {
 data class Video(
     val id: String = UUID.randomUUID().toString(),
     val uri: Uri,
-    var isComplete: Boolean = false,
+    var isComplete: Boolean = false
 )
 
 data class Course(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
-    val thumbnailPath: String? = null, // Path to saved thumbnail
-    val videos: List<Video>
+    var thumbnailPath: String? = null,
+    val videos: List<Video>,
+    val thumbnailState: MutableState<String?> = mutableStateOf(null)
 )
-
 
 /** --------------------- VIEWMODEL --------------------- */
 class CourseViewModel : ViewModel() {
+
     var courses = mutableStateListOf<Course>()
         private set
 
@@ -170,6 +169,87 @@ class CourseViewModel : ViewModel() {
     }
 
     fun getCourse(id: String) = courses.find { it.id == id }
+
+    fun loadCourseThumbnail(course: Course, context: Context) {
+        if (course.thumbnailState.value != null) return
+        val firstVideo = course.videos[1] ?: return
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val retriever = MediaMetadataRetriever()
+                retriever.setDataSource(context, firstVideo.uri)
+                val bitmap = retriever.frameAtTime
+                retriever.release()
+
+                bitmap?.let {
+                    val file = File(context.cacheDir, "${course.id}_thumb.png")
+                    FileOutputStream(file).use { out -> it.compress(Bitmap.CompressFormat.PNG, 100, out) }
+                    val path = file.absolutePath
+
+                    withContext(Dispatchers.Main) {
+                        course.thumbnailPath = path
+                        course.thumbnailState.value = path
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    fun loadCoursesFromParentFolder(activity: Activity, parentUri: Uri, db: AppDatabase) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val parent = DocumentFile.fromTreeUri(activity, parentUri) ?: return@launch
+            val loadedCourses = mutableListOf<Course>()
+
+            parent.listFiles().forEach { subFolder ->
+                if (subFolder.isDirectory) {
+                    val videoFiles = subFolder.listFiles()
+                        .filter { it.isFile && it.name?.endsWith(".mp4", true) == true }
+                        .map { Video(uri = it.uri) }
+
+                    if (videoFiles.isNotEmpty()) {
+                        val course = Course(
+                            id = UUID.randomUUID().toString(),
+                            name = subFolder.name ?: "Untitled",
+                            videos = videoFiles
+                        )
+                        loadedCourses.add(course)
+                    }
+                }
+            }
+
+            // Save to Room
+            val courseEntities = loadedCourses.map { c -> CourseEntity(c.id, c.name, thumbnailUri = c.thumbnailPath) }
+            val videoEntities = loadedCourses.flatMap { c ->
+                c.videos.map { v -> VideoEntity(v.id, c.id, v.uri.toString(), v.isComplete) }
+            }
+            db.courseDao().insertCourses(courseEntities)
+            db.videoDao().insertVideos(videoEntities)
+
+            withContext(Dispatchers.Main) {
+                setCourses(loadedCourses)
+            }
+        }
+    }
+
+    fun loadSavedCourses(db: AppDatabase, context: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val savedCourses = db.courseDao().getAllCourses()
+            if (savedCourses.isNotEmpty()) {
+                val coursesWithVideos = savedCourses.map { c ->
+                    val videos = db.videoDao().getVideosForCourse(c.id).map { v ->
+                        Video(v.id, Uri.parse(v.uri), v.isComplete)
+                    }
+                    Course(c.id, c.name, c.thumbnailUri, videos)
+                }
+
+                withContext(Dispatchers.Main) {
+                    setCourses(coursesWithVideos)
+                }
+            }
+        }
+    }
 }
 
 /** --------------------- MAIN ACTIVITY --------------------- */
@@ -185,17 +265,14 @@ class MainActivity : ComponentActivity() {
                 val context = LocalContext.current
                 val db = AppDatabase.getDatabase(context)
 
+                LaunchedEffect(Unit) { viewModel.loadSavedCourses(db, context) }
+
                 NavHost(navController, startDestination = "course_list") {
                     composable("course_list") {
-                        CourseListScreen(
-                            viewModel = viewModel,
-                            onCourseClick = { course ->
-                                navController.currentBackStackEntry?.savedStateHandle
-                                    ?.set("courseId", course.id)
-                                navController.navigate("video_list/${course.id}")
-                            },
-                            db = db
-                        )
+                        CourseListScreen(viewModel, db) { course ->
+                            navController.currentBackStackEntry?.savedStateHandle?.set("courseId", course.id)
+                            navController.navigate("video_list/${course.id}")
+                        }
                     }
                     composable(
                         "video_list/{courseId}",
@@ -203,11 +280,7 @@ class MainActivity : ComponentActivity() {
                     ) { backStackEntry ->
                         val courseId = backStackEntry.arguments?.getString("courseId") ?: return@composable
                         val course = viewModel.getCourse(courseId) ?: return@composable
-                        VideoListScreen(
-                            course = course,
-                            viewModel = viewModel,
-                            db = db
-                        )
+                        VideoListScreen(course, viewModel, db)
                     }
                 }
             }
@@ -217,9 +290,8 @@ class MainActivity : ComponentActivity() {
 
 /** --------------------- COMPOSABLES --------------------- */
 @Composable
-fun CourseListScreen(viewModel: CourseViewModel, onCourseClick: (Course) -> Unit, db: AppDatabase) {
+fun CourseListScreen(viewModel: CourseViewModel, db: AppDatabase, onCourseClick: (Course) -> Unit) {
     val context = LocalContext.current
-    val parentFolderDao = db.parentFolderDao()
     val courses = viewModel.courses
     val scope = rememberCoroutineScope()
 
@@ -227,38 +299,8 @@ fun CourseListScreen(viewModel: CourseViewModel, onCourseClick: (Course) -> Unit
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { uri: Uri? ->
         uri?.let {
-            context.contentResolver.takePersistableUriPermission(
-                it,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION
-            )
-
-            scope.launch {
-                parentFolderDao.insert(ParentFolderEntity(uri = it.toString()))
-                val loadedCourses = loadCoursesFromParentFolder(context as Activity, it)
-
-                // Save to Room
-                val courseEntities = loadedCourses.map { c -> CourseEntity(c.id, c.name, thumbnailUri = c.thumbnailPath) }
-                val videoEntities = loadedCourses.flatMap { c ->
-                    c.videos.map { v -> VideoEntity(v.id, c.id, v.uri.toString(), v.isComplete) }
-                }
-                db.courseDao().insertCourses(courseEntities)
-                db.videoDao().insertVideos(videoEntities)
-
-                viewModel.setCourses(loadedCourses)
-            }
-        }
-    }
-
-    LaunchedEffect(Unit) {
-        val savedCourses = db.courseDao().getAllCourses()
-        if (savedCourses.isNotEmpty()) {
-            val coursesWithVideos = savedCourses.map { c ->
-                val videos = db.videoDao().getVideosForCourse(c.id).map { v ->
-                    Video(v.id, Uri.parse(v.uri), v.isComplete)
-                }
-                Course(c.id, c.name, c.thumbnailUri, videos)
-            }
-            viewModel.setCourses(coursesWithVideos)
+            context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            scope.launch { viewModel.loadCoursesFromParentFolder(context as Activity, it, db) }
         }
     }
 
@@ -271,14 +313,16 @@ fun CourseListScreen(viewModel: CourseViewModel, onCourseClick: (Course) -> Unit
     ) { padding ->
         LazyColumn(modifier = Modifier.padding(padding)) {
             items(courses) { course ->
-                CourseCard(course) { onCourseClick(course) }
+                CourseCard(course, viewModel, context) { onCourseClick(course) }
             }
         }
     }
 }
 
 @Composable
-fun CourseCard(course: Course, onClick: () -> Unit) {
+fun CourseCard(course: Course, viewModel: CourseViewModel, context: Context, onClick: () -> Unit) {
+    val thumbnail by course.thumbnailState
+    LaunchedEffect(course.id) { viewModel.loadCourseThumbnail(course, context) }
 
     val completedCount = course.videos.count { it.isComplete }
     val totalCount = course.videos.size
@@ -295,36 +339,27 @@ fun CourseCard(course: Course, onClick: () -> Unit) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 AsyncImage(
-                    model = course.thumbnailPath, // or course.thumbnailPath
-                    contentDescription = "Video Thumbnail",
-                    modifier = Modifier
-                        .size(80.dp)
-                        .clip(RoundedCornerShape(8.dp))
+                    model = thumbnail,
+                    contentDescription = "Course Thumbnail",
+                    modifier = Modifier.size(80.dp).clip(RoundedCornerShape(8.dp))
                 )
                 Spacer(Modifier.width(16.dp))
                 Column {
                     Text(course.name, style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        "${(completionPercent * 100).toInt()}% completed",
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                    Text("${(completionPercent * 100).toInt()}% completed", style = MaterialTheme.typography.bodySmall)
                 }
             }
             Spacer(Modifier.height(8.dp))
             LinearProgressIndicator(
-                progress = { completionPercent },
-                modifier = Modifier
-                                .fillMaxWidth()
-                                .height(8.dp)
-                                .clip(RoundedCornerShape(4.dp)),
+                progress = completionPercent,
+                modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
                 color = ProgressIndicatorDefaults.linearColor,
                 trackColor = ProgressIndicatorDefaults.linearTrackColor,
-                strokeCap = ProgressIndicatorDefaults.LinearStrokeCap,
+                strokeCap = ProgressIndicatorDefaults.LinearStrokeCap
             )
         }
     }
 }
-
 
 @Composable
 fun VideoListScreen(course: Course, viewModel: CourseViewModel, db: AppDatabase) {
@@ -334,7 +369,7 @@ fun VideoListScreen(course: Course, viewModel: CourseViewModel, db: AppDatabase)
             VideoItem(video = video, onToggleComplete = {
                 val newStatus = !video.isComplete
                 viewModel.updateVideo(course.id, video.id, newStatus)
-                scope.launch {
+                scope.launch(Dispatchers.IO) {
                     db.videoDao().updateVideo(VideoEntity(video.id, course.id, video.uri.toString(), newStatus))
                 }
             }, context = LocalContext.current)
@@ -344,13 +379,40 @@ fun VideoListScreen(course: Course, viewModel: CourseViewModel, db: AppDatabase)
 
 @Composable
 fun VideoItem(video: Video, onToggleComplete: () -> Unit, context: Context) {
-    // Determine thumbnail path
-    val thumbnailPath = remember(video.uri) { getVideoThumbnail(context as Activity, video.uri) }
+    val thumbnailState = remember(video.uri) { mutableStateOf<String?>(null) }
+
+    // Generate thumbnail asynchronously
+    LaunchedEffect(video.uri) {
+        thumbnailState.value = withContext(Dispatchers.IO) {
+            try {
+                val retriever = MediaMetadataRetriever()
+                retriever.setDataSource(context, video.uri)
+                val bitmap = retriever.frameAtTime
+                retriever.release()
+                bitmap?.let {
+                    val file = File(context.cacheDir, "${video.id}_thumb.png")
+                    FileOutputStream(file).use { out -> it.compress(Bitmap.CompressFormat.PNG, 100, out) }
+                    file.absolutePath
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                null
+            }
+        }
+    }
 
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
+            .clickable {
+                // Open external video player
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(video.uri, "video/*")
+                    flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                }
+                context.startActivity(intent)
+            }
     ) {
         Row(
             modifier = Modifier
@@ -359,112 +421,19 @@ fun VideoItem(video: Video, onToggleComplete: () -> Unit, context: Context) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             AsyncImage(
-                model = thumbnailPath, // Coil will load from file if exists
+                model = thumbnailState.value,
                 contentDescription = "Video Thumbnail",
-                modifier = Modifier
-                    .size(80.dp)
-                    .clip(RoundedCornerShape(8.dp))
+                modifier = Modifier.size(80.dp).clip(RoundedCornerShape(8.dp))
             )
-
             Spacer(Modifier.width(16.dp))
-
             Text(
                 text = video.uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.') ?: "Video",
                 modifier = Modifier.weight(1f)
             )
-
             Checkbox(
                 checked = video.isComplete,
                 onCheckedChange = { onToggleComplete() }
             )
         }
-    }
-}
-
-
-/** --------------------- HELPERS --------------------- */
-fun loadCoursesFromParentFolder(activity: Activity, parentUri: Uri): List<Course> {
-    val parent = DocumentFile.fromTreeUri(activity, parentUri) ?: return emptyList()
-    val courses = mutableListOf<Course>()
-
-    parent.listFiles().forEach { subFolder ->
-        if (subFolder.isDirectory) {
-            val videoFiles = subFolder.listFiles()
-                .filter { it.isFile && it.name?.endsWith(".mp4", true) == true }
-                .map { Video(uri = it.uri, isComplete = false) }
-
-            if (videoFiles.isNotEmpty()) {
-                val thumbnailBitmap = getVideoThumbnail(activity, videoFiles[1].uri)
-                val thumbnailPath = thumbnailBitmap?.let { saveThumbnailToCache(activity, it, subFolder.name ?: UUID.randomUUID().toString()) }
-
-                courses.add(
-                    Course(
-                        id = UUID.randomUUID().toString(),
-                        name = subFolder.name ?: "Untitled",
-                        thumbnailPath = thumbnailPath,
-                        videos = videoFiles
-                    )
-                )
-            }
-        }
-    }
-
-    return courses
-}
-
-
-data class CourseWithVideos(
-    val course: Course,
-    val videos: List<Video>
-)
-suspend fun generateAndSaveVideoThumbnail(
-    context: Context,
-    videoPath: String
-): String? = withContext(Dispatchers.IO) {
-    try {
-        val retriever = MediaMetadataRetriever()
-        retriever.setDataSource(videoPath)
-
-        val bitmap = retriever.getFrameAtTime(0) // first frame
-        retriever.release()
-
-        bitmap?.let {
-            val thumbnailsDir = File(context.filesDir, "video_thumbnails")
-            if (!thumbnailsDir.exists()) thumbnailsDir.mkdirs()
-
-            val id = videoPath.hashCode().toString()
-            val thumbnailFile = File(thumbnailsDir, "$id.jpg")
-
-            FileOutputStream(thumbnailFile).use { out ->
-                it.compress(Bitmap.CompressFormat.JPEG, 80, out)
-            }
-            return@withContext thumbnailFile.absolutePath
-        }
-    } catch (e: Exception) {
-        e.printStackTrace()
-    }
-    null
-}
-
-
-fun saveThumbnailToCache(context: Context, bitmap: Bitmap, courseId: String): String {
-    val file = File(context.cacheDir, "${courseId}_thumb.png")
-    file.outputStream().use { out ->
-        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-    }
-    return file.absolutePath
-}
-
-
-fun getVideoThumbnail(activity: Activity, videoUri: Uri): Bitmap? {
-    return try {
-        val retriever = MediaMetadataRetriever()
-        retriever.setDataSource(activity, videoUri)
-        val bitmap = retriever.frameAtTime
-        retriever.release()
-        bitmap
-    } catch (e: Exception) {
-        e.printStackTrace()
-        null
     }
 }
