@@ -519,28 +519,30 @@ class MainActivity : ComponentActivity() {
     fun VideoItem(video: Video, onToggleComplete: () -> Unit, context: Context) {
         val thumbnailState = remember(video.uri) { mutableStateOf<String?>(null) }
 
-        // Generate thumbnail asynchronously
+        // 🔑 check cache first
         LaunchedEffect(video.uri) {
-            thumbnailState.value = withContext(Dispatchers.IO) {
-                try {
-                    val retriever = MediaMetadataRetriever()
-                    retriever.setDataSource(context, video.uri)
-                    val bitmap = retriever.frameAtTime
-                    retriever.release()
-                    bitmap?.let {
-                        val file = File(context.cacheDir, "${video.id}_thumb.png")
-                        FileOutputStream(file).use { out ->
-                            it.compress(
-                                Bitmap.CompressFormat.PNG,
-                                100,
-                                out
-                            )
+            withContext(Dispatchers.IO) {
+                val cacheFile = File(context.cacheDir, "${video.id}_thumb.png")
+                if (cacheFile.exists()) {
+                    // load from cache
+                    thumbnailState.value = cacheFile.absolutePath
+                } else {
+                    // generate new thumbnail
+                    try {
+                        val retriever = MediaMetadataRetriever()
+                        retriever.setDataSource(context, video.uri)
+                        val bitmap = retriever.frameAtTime
+                        retriever.release()
+
+                        bitmap?.let {
+                            FileOutputStream(cacheFile).use { out ->
+                                it.compress(Bitmap.CompressFormat.PNG, 100, out)
+                            }
+                            thumbnailState.value = cacheFile.absolutePath
                         }
-                        file.absolutePath
+                    } catch (e: Exception) {
+                        e.printStackTrace()
                     }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    null
                 }
             }
         }
@@ -550,7 +552,6 @@ class MainActivity : ComponentActivity() {
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 6.dp)
                 .clickable {
-                    // Open external video player
                     val intent = Intent(Intent.ACTION_VIEW).apply {
                         setDataAndType(video.uri, "video/*")
                         flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
@@ -581,13 +582,13 @@ class MainActivity : ComponentActivity() {
                     checked = video.isComplete,
                     onCheckedChange = { onToggleComplete() },
                     colors = CheckboxDefaults.colors(
-                        checkedColor = MaterialTheme.colorScheme.primary,   // when checked
-                        uncheckedColor = MaterialTheme.colorScheme.onSurfaceVariant, // when not checked
-                        checkmarkColor = MaterialTheme.colorScheme.onPrimary // color of ✓
+                        checkedColor = MaterialTheme.colorScheme.primary,
+                        uncheckedColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        checkmarkColor = MaterialTheme.colorScheme.onPrimary
                     )
                 )
-
             }
         }
     }
+
 }
