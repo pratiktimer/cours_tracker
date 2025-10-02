@@ -19,13 +19,18 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.Checkbox
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.ViewModel
@@ -202,10 +207,14 @@ class CourseViewModel : ViewModel() {
             val parent = DocumentFile.fromTreeUri(activity, parentUri) ?: return@launch
             val loadedCourses = mutableListOf<Course>()
 
-            parent.listFiles().forEach { subFolder ->
-                if (subFolder.isDirectory) {
+            parent.listFiles()
+                .filter { it.isDirectory }
+                .sortedWith(compareBy(naturalSortComparator()) { it.name ?: "" }) // 👈 natural sort
+                .forEach { subFolder ->
+
                     val videoFiles = subFolder.listFiles()
                         .filter { it.isFile && it.name?.endsWith(".mp4", true) == true }
+                        .sortedWith(compareBy(naturalSortComparator()) { it.name ?: "" }) // 👈 natural sort
                         .map { Video(uri = it.uri) }
 
                     if (videoFiles.isNotEmpty()) {
@@ -217,7 +226,6 @@ class CourseViewModel : ViewModel() {
                         loadedCourses.add(course)
                     }
                 }
-            }
 
             // Save to Room
             val courseEntities = loadedCourses.map { c -> CourseEntity(c.id, c.name, thumbnailUri = c.thumbnailPath) }
@@ -232,6 +240,31 @@ class CourseViewModel : ViewModel() {
             }
         }
     }
+    fun naturalSortComparator(): Comparator<String> {
+        val regex = "\\d+".toRegex()
+        return Comparator { a, b ->
+            if (a == null && b == null) return@Comparator 0
+            if (a == null) return@Comparator -1
+            if (b == null) return@Comparator 1
+
+            val aParts = regex.findAll(a).map { it.value }.toList()
+            val bParts = regex.findAll(b).map { it.value }.toList()
+
+            val aNums = aParts.mapNotNull { it.toIntOrNull() }
+            val bNums = bParts.mapNotNull { it.toIntOrNull() }
+
+            // Compare numbers if both have them
+            if (aNums.isNotEmpty() && bNums.isNotEmpty()) {
+                val cmp = aNums[0].compareTo(bNums[0])
+                if (cmp != 0) return@Comparator cmp
+            }
+
+            // Fallback to normal string comparison
+            return@Comparator a.compareTo(b, ignoreCase = true)
+        }
+    }
+
+
 
     fun loadSavedCourses(db: AppDatabase, context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -267,10 +300,12 @@ class MainActivity : ComponentActivity() {
 
                 LaunchedEffect(Unit) { viewModel.loadSavedCourses(db, context) }
 
+                // In MainActivity.kt -> onCreate
+
                 NavHost(navController, startDestination = "course_list") {
                     composable("course_list") {
                         CourseListScreen(viewModel, db) { course ->
-                            navController.currentBackStackEntry?.savedStateHandle?.set("courseId", course.id)
+                            // You don't need to pass the courseId via SavedStateHandle if you're navigating directly
                             navController.navigate("video_list/${course.id}")
                         }
                     }
@@ -278,162 +313,281 @@ class MainActivity : ComponentActivity() {
                         "video_list/{courseId}",
                         arguments = listOf(navArgument("courseId") { type = NavType.StringType })
                     ) { backStackEntry ->
-                        val courseId = backStackEntry.arguments?.getString("courseId") ?: return@composable
+                        val courseId =
+                            backStackEntry.arguments?.getString("courseId") ?: return@composable
                         val course = viewModel.getCourse(courseId) ?: return@composable
-                        VideoListScreen(course, viewModel, db)
+                        VideoListScreen(
+                            course = course,
+                            viewModel = viewModel,
+                            db = db,
+                            onNavigateUp = { navController.navigateUp() } // Pass the navigate up action
+                        )
                     }
                 }
+
             }
         }
     }
-}
 
-/** --------------------- COMPOSABLES --------------------- */
-@Composable
-fun CourseListScreen(viewModel: CourseViewModel, db: AppDatabase, onCourseClick: (Course) -> Unit) {
-    val context = LocalContext.current
-    val courses = viewModel.courses
-    val scope = rememberCoroutineScope()
+    /** --------------------- COMPOSABLES --------------------- */
+// In MainActivity.kt
 
-    val folderPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree()
-    ) { uri: Uri? ->
-        uri?.let {
-            context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            scope.launch { viewModel.loadCoursesFromParentFolder(context as Activity, it, db) }
-        }
-    }
-
-    Scaffold(
-        floatingActionButton = {
-            FloatingActionButton(onClick = { folderPickerLauncher.launch(null) }) {
-                Icon(Icons.Default.Add, contentDescription = "Add")
-            }
-        }
-    ) { padding ->
-        LazyColumn(modifier = Modifier.padding(padding)) {
-            items(courses) { course ->
-                CourseCard(course, viewModel, context) { onCourseClick(course) }
-            }
-        }
-    }
-}
-
-@Composable
-fun CourseCard(course: Course, viewModel: CourseViewModel, context: Context, onClick: () -> Unit) {
-    val thumbnail by course.thumbnailState
-    LaunchedEffect(course.id) { viewModel.loadCourseThumbnail(course, context) }
-
-    val completedCount = course.videos.count { it.isComplete }
-    val totalCount = course.videos.size
-    val completionPercent = if (totalCount > 0) completedCount.toFloat() / totalCount else 0f
-
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(8.dp)
-            .clickable { onClick() },
-        shape = RoundedCornerShape(16.dp),
-        elevation = CardDefaults.cardElevation(8.dp)
+    @Composable
+    fun CourseListScreen(
+        viewModel: CourseViewModel,
+        db: AppDatabase,
+        onCourseClick: (Course) -> Unit
     ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+        val context = LocalContext.current
+        val courses = viewModel.courses
+        val scope = rememberCoroutineScope()
+
+        val folderPickerLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.OpenDocumentTree()
+        ) { uri: Uri? ->
+            uri?.let {
+                context.contentResolver.takePersistableUriPermission(
+                    it,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+                // Use the activity context to launch the coroutine
+                (context as? Activity)?.let { activity ->
+                    scope.launch { viewModel.loadCoursesFromParentFolder(activity, it, db) }
+                }
+            }
+        }
+
+        Scaffold(
+            // Apply modifier to respect system gestures (like the back gesture)
+            modifier = Modifier.fillMaxSize(),
+            floatingActionButton = {
+                FloatingActionButton(
+                    onClick = { folderPickerLauncher.launch(null) },
+                    // Apply insets to the FAB to avoid the navigation bar
+                    modifier = Modifier.windowInsetsPadding(
+                        WindowInsets.safeDrawing.only(
+                            WindowInsetsSides.Bottom
+                        )
+                    )
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = "Add course")
+                }
+            }
+        ) { innerPadding ->
+            LazyColumn(
+                // Use the innerPadding from the Scaffold
+                modifier = Modifier.padding(innerPadding),
+                // Add content padding to respect the status and navigation bars
+                contentPadding = WindowInsets.safeDrawing
+                    .only(WindowInsetsSides.Horizontal + WindowInsetsSides.Top)
+                    .asPaddingValues()
+            ) {
+                items(courses) { course ->
+                    CourseCard(course, viewModel, context) { onCourseClick(course) }
+                }
+            }
+        }
+    }
+
+
+    // In MainActivity.kt
+
+    @Composable
+    fun CourseCard(course: Course, viewModel: CourseViewModel, context: Context, onClick: () -> Unit) {
+        val thumbnail by course.thumbnailState
+        LaunchedEffect(course.id) { viewModel.loadCourseThumbnail(course, context) }
+
+        val completedCount = course.videos.count { it.isComplete }
+        val totalCount = course.videos.size
+        val completionPercent = if (totalCount > 0) completedCount.toFloat() / totalCount else 0f
+
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp) // Adjust padding
+                .clickable(onClick = onClick),
+            shape = RoundedCornerShape(16.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    AsyncImage(
+                        model = thumbnail,
+                        contentDescription = "Course Thumbnail",
+                        modifier = Modifier
+                            .size(80.dp) // Slightly smaller image
+                            .clip(RoundedCornerShape(12.dp)),
+                        contentScale = ContentScale.Inside, // Ensure image fills the space
+                        placeholder = painterResource(id = R.drawable.ic_launcher_background), // Add a placeholder
+                        error = painterResource(id = R.drawable.ic_launcher_background) // Add an error drawable
+                    )
+                    Spacer(Modifier.width(16.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(course.name, style = MaterialTheme.typography.titleLarge)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "${(completionPercent * 100).toInt()}% completed ($completedCount/$totalCount)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+                LinearProgressIndicator(
+                    progress = { completionPercent }, // For Material 3
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(8.dp)
+                        .clip(RoundedCornerShape(4.dp)),
+                    strokeCap = StrokeCap.Round // Nicer rounded caps
+                )
+            }
+        }
+    }
+
+
+// In MainActivity.kt
+
+    @OptIn(ExperimentalMaterial3Api::class)
+    @Composable
+    fun VideoListScreen(
+        course: Course,
+        viewModel: CourseViewModel,
+        db: AppDatabase,
+        onNavigateUp: () -> Unit
+    ) {
+        val scope = rememberCoroutineScope()
+
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text(course.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    navigationIcon = {
+                        IconButton(onClick = onNavigateUp) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                    },
+                    // Apply insets to the TopAppBar
+                    modifier = Modifier.windowInsetsPadding(
+                        WindowInsets.safeDrawing.only(
+                            WindowInsetsSides.Top
+                        )
+                    )
+                )
+            }
+        ) { innerPadding ->
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding), // Use padding from Scaffold
+                // Add horizontal and bottom padding to avoid system bars and FAB area
+                contentPadding = WindowInsets.safeDrawing
+                    .only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
+                    .asPaddingValues()
+            ) {
+                items(course.videos) { video ->
+                    VideoItem(
+                        video = video,
+                        onToggleComplete = {
+                            val newStatus = !video.isComplete
+                            viewModel.updateVideo(course.id, video.id, newStatus)
+                            scope.launch(Dispatchers.IO) {
+                                db.videoDao().updateVideo(
+                                    VideoEntity(
+                                        video.id,
+                                        course.id,
+                                        video.uri.toString(),
+                                        newStatus
+                                    )
+                                )
+                            }
+                        },
+                        context = LocalContext.current
+                    )
+                }
+            }
+        }
+    }
+
+
+    @Composable
+    fun VideoItem(video: Video, onToggleComplete: () -> Unit, context: Context) {
+        val thumbnailState = remember(video.uri) { mutableStateOf<String?>(null) }
+
+        // Generate thumbnail asynchronously
+        LaunchedEffect(video.uri) {
+            thumbnailState.value = withContext(Dispatchers.IO) {
+                try {
+                    val retriever = MediaMetadataRetriever()
+                    retriever.setDataSource(context, video.uri)
+                    val bitmap = retriever.frameAtTime
+                    retriever.release()
+                    bitmap?.let {
+                        val file = File(context.cacheDir, "${video.id}_thumb.png")
+                        FileOutputStream(file).use { out ->
+                            it.compress(
+                                Bitmap.CompressFormat.PNG,
+                                100,
+                                out
+                            )
+                        }
+                        file.absolutePath
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    null
+                }
+            }
+        }
+
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 6.dp)
+                .clickable {
+                    // Open external video player
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(video.uri, "video/*")
+                        flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    }
+                    context.startActivity(intent)
+                }
+        ) {
+            Row(
+                modifier = Modifier
+                    .padding(8.dp)
+                    .fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 AsyncImage(
-                    model = thumbnail,
-                    contentDescription = "Course Thumbnail",
-                    modifier = Modifier.size(80.dp).clip(RoundedCornerShape(8.dp))
+                    model = thumbnailState.value,
+                    contentDescription = "Video Thumbnail",
+                    modifier = Modifier
+                        .size(80.dp)
+                        .clip(RoundedCornerShape(8.dp))
                 )
                 Spacer(Modifier.width(16.dp))
-                Column {
-                    Text(course.name, style = MaterialTheme.typography.titleMedium)
-                    Text("${(completionPercent * 100).toInt()}% completed", style = MaterialTheme.typography.bodySmall)
-                }
+                Text(
+                    text = video.uri.lastPathSegment?.substringAfterLast('/')
+                        ?.substringBeforeLast('.') ?: "Video",
+                    modifier = Modifier.weight(1f)
+                )
+                Checkbox(
+                    checked = video.isComplete,
+                    onCheckedChange = { onToggleComplete() },
+                    colors = CheckboxDefaults.colors(
+                        checkedColor = MaterialTheme.colorScheme.primary,   // when checked
+                        uncheckedColor = MaterialTheme.colorScheme.onSurfaceVariant, // when not checked
+                        checkmarkColor = MaterialTheme.colorScheme.onPrimary // color of ✓
+                    )
+                )
+
             }
-            Spacer(Modifier.height(8.dp))
-            LinearProgressIndicator(
-                progress = completionPercent,
-                modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
-                color = ProgressIndicatorDefaults.linearColor,
-                trackColor = ProgressIndicatorDefaults.linearTrackColor,
-                strokeCap = ProgressIndicatorDefaults.LinearStrokeCap
-            )
-        }
-    }
-}
-
-@Composable
-fun VideoListScreen(course: Course, viewModel: CourseViewModel, db: AppDatabase) {
-    val scope = rememberCoroutineScope()
-    LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        items(course.videos) { video ->
-            VideoItem(video = video, onToggleComplete = {
-                val newStatus = !video.isComplete
-                viewModel.updateVideo(course.id, video.id, newStatus)
-                scope.launch(Dispatchers.IO) {
-                    db.videoDao().updateVideo(VideoEntity(video.id, course.id, video.uri.toString(), newStatus))
-                }
-            }, context = LocalContext.current)
-        }
-    }
-}
-
-@Composable
-fun VideoItem(video: Video, onToggleComplete: () -> Unit, context: Context) {
-    val thumbnailState = remember(video.uri) { mutableStateOf<String?>(null) }
-
-    // Generate thumbnail asynchronously
-    LaunchedEffect(video.uri) {
-        thumbnailState.value = withContext(Dispatchers.IO) {
-            try {
-                val retriever = MediaMetadataRetriever()
-                retriever.setDataSource(context, video.uri)
-                val bitmap = retriever.frameAtTime
-                retriever.release()
-                bitmap?.let {
-                    val file = File(context.cacheDir, "${video.id}_thumb.png")
-                    FileOutputStream(file).use { out -> it.compress(Bitmap.CompressFormat.PNG, 100, out) }
-                    file.absolutePath
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                null
-            }
-        }
-    }
-
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp)
-            .clickable {
-                // Open external video player
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(video.uri, "video/*")
-                    flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
-                }
-                context.startActivity(intent)
-            }
-    ) {
-        Row(
-            modifier = Modifier
-                .padding(8.dp)
-                .fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            AsyncImage(
-                model = thumbnailState.value,
-                contentDescription = "Video Thumbnail",
-                modifier = Modifier.size(80.dp).clip(RoundedCornerShape(8.dp))
-            )
-            Spacer(Modifier.width(16.dp))
-            Text(
-                text = video.uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.') ?: "Video",
-                modifier = Modifier.weight(1f)
-            )
-            Checkbox(
-                checked = video.isComplete,
-                onCheckedChange = { onToggleComplete() }
-            )
         }
     }
 }
